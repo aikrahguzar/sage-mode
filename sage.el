@@ -75,19 +75,33 @@ This happens when the Sage process exits."
 
 (defvar sage-setup-code
   "\
-def __PYTHON_EL_eval_file(filename, tempname, delete):
-    import codecs, os, re
+def __PYTHON_EL_eval(source, filename):
+    import ast, sys
     from sage.repl.preparse import preparse_file
-    pattern = r'^[ 	]*#.*?coding[:=][ 	]*([-_.a-zA-Z0-9]+)'
-    with codecs.open(tempname or filename, encoding='latin-1') as file:
-        match = re.match(pattern, file.readline())
-        match = match or re.match(pattern, file.readline())
-        encoding = match.group(1) if match else 'utf-8'
-    with codecs.open(tempname or filename, encoding=encoding) as file:
-        source = preparse_file(file.read()).encode(encoding)
-    if delete and tempname:
-        os.remove(tempname)
-    return __PYTHON_EL_eval(source, filename)
+    if isinstance(source, str):
+        source = preparse_file(source)
+    else:
+        source = preparse_file(source.decode())
+    if sys.version_info[0] == 2:
+        from __builtin__ import compile, eval, globals
+    else:
+        from builtins import compile, eval, globals
+    try:
+        p, e = ast.parse(source, filename), None
+    except SyntaxError:
+        t, v, tb = sys.exc_info()
+        sys.excepthook(t, v, tb.tb_next)
+        return
+    if p.body and isinstance(p.body[-1], ast.Expr):
+        e = p.body.pop()
+    try:
+        g = globals()
+        exec(compile(p, filename, 'exec'), g, g)
+        if e:
+            return eval(compile(ast.Expression(e.value), filename, 'eval'), g, g)
+    except Exception:
+        t, v, tb = sys.exc_info()
+        sys.excepthook(t, v, tb.tb_next)
 
 __IP_complete = get_ipython().Completer.complete"
   "Code used to evaluate statements in sage repl.
