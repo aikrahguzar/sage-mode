@@ -103,7 +103,12 @@ def __PYTHON_EL_eval(source, filename):
         t, v, tb = sys.exc_info()
         sys.excepthook(t, v, tb.tb_next)
 
-__IP_complete = get_ipython().Completer.complete"
+import jedi
+jedi.settings.case_insensitive_completion = True
+
+from IPython.core.completer import IPCompleter
+__IP_completer = IPCompleter(shell=get_ipython() , namespace=locals())
+"
   "Code used to evaluate statements in sage repl.
 Default value is adapted from `python-shell-eval-setup-code' with the
 difference that this in addition preparses the sage input.")
@@ -113,7 +118,6 @@ difference that this in addition preparses the sage input.")
   :group 'sage
 
   (setq-local comint-redirect-finished-regexp comint-prompt-regexp
-              comint-input-sender #'sage-send-input
               comint-redirect-completed t
               comint-input-ring-file-name sage-history-file
               comint-input-ignoredups t)
@@ -126,7 +130,7 @@ difference that this in addition preparses the sage input.")
   (setq-local completion-at-point-functions '(sage-completions-at-point t))
 
   (add-hook 'kill-buffer-hook #'comint-write-input-ring nil t)
-  (add-hook 'comint-output-filter-functions #'sage--restore-input-maybe))
+  (add-hook 'comint-output-filter-functions #'sage--restore-input-maybe t t))
 
 (defvar python-shell--interpreter)
 (defvar python-shell--interpreter-args)
@@ -140,13 +144,13 @@ nil the buffer `*Sage*' is used and resued if it already present.
 If buffer thus found has no associated process a sage process is satrted.
 SWITCHES are the arguments passed to it as in `make-comint-in-buffer'.
 If DISPLAY is non-nil the buffer is displayed."
-  (let ((buf (get-buffer-create
-              (if (stringp buffer-name)
-                  buffer-name
-                (format "*%s*" (python-shell-get-process-name buffer-name))))))
+  (let* ((proc (python-shell-get-process-name buffer-name))
+         (buf (get-buffer-create (if (stringp buffer-name)
+                                     buffer-name
+                                   (format "*%s*" proc)))))
     (if display (display-buffer buf))
     (unless (get-buffer-process buf)
-      (apply #'make-comint-in-buffer "Sage" buf (sage-executable) nil switches)
+      (apply #'make-comint-in-buffer proc buf (sage-executable) nil switches)
       (with-current-buffer buf
         (let ((inhibit-read-only t)) (erase-buffer))
         (let ((python-shell--interpreter "sage")
@@ -159,7 +163,7 @@ If DISPLAY is non-nil the buffer is displayed."
 
 ;;;###autoload
 (defun sage-run (arg &optional display)
-  "Run sage. If ARG is non-nil start a new sage process.
+  "Run sage. If ARG is non-nil start a dedicated sage process.
 If DISPLAY is non-nil display the resulting buffer."
   (interactive (list current-prefix-arg t))
   (sage--run arg display "--simple-prompt"))
@@ -170,24 +174,47 @@ If DISPLAY is non-nil display the resulting buffer."
   (when-let ((buf (python-shell-get-buffer))
              (proc (get-buffer-process buf)))
     (with-current-buffer buf
-      (comint-send-eof) (set-process-buffer proc nil)))
-  (sage-run nil))
+      (comint-send-eof) (set-process-buffer proc nil) (kill-process proc)))
+  (sage-run (get-buffer (format "*%s*" (python-shell-get-process-name t)))))
+
+(defvar-local sage--completion-table nil)
+
+(defun sage-completion-table ()
+  "A completion table returning completions from sage process PROC.
+It returns a lambda which accepts one argumet SYMBOL and returns
+a list of all completions for SYMBOL.
+
+The design is taken from `completion-table-with-cache' but accounts
+for the fact that we get new completions after encountering a new dot."
+  (let* (last-arg
+         last-result
+         (proc (python-shell-get-process))
+         (new-fun
+          (lambda (arg)
+            (if (and last-arg (string-prefix-p last-arg arg t)
+                     (not (string-match (rx ?.) arg (max 0 (1- (length last-arg))))))
+                last-result
+              (when-let ((completions
+                          (while-no-input
+                            (comint-redirect-results-list-from-process
+                             proc
+                             (format "__IP_completer.all_completions('%s')" arg)
+                             (rx ?' (group-n 1 (* (not ?'))) ?') 1)))
+                         ((not (booleanp completions))))
+                (setq last-arg arg)
+                (message arg)
+                (setq last-result completions))))))
+    (completion-table-dynamic new-fun)))
 
 (defun sage-completions-at-point ()
   "Completions at point from the sage process."
-  (when-let ((buf (get-buffer (python-shell-get-buffer)))
-             ((buffer-local-value 'comint-redirect-completed buf))
-             (proc (get-buffer-process buf))
-             (start (line-beginning-position))
-             (completions (while-no-input
-                            (comint-redirect-results-list-from-process
-                             proc
-                             (format "__IP_complete(line_buffer='%s' , cursor_pos=%s)"
-                                     (buffer-substring start (line-end-position))
-                                     (- (point) start))
-                             (rx ?' (group-n 1 (* (not ?'))) ?') 1)))
-             ((not (booleanp completions))))
-    (list (- (point) (length (car completions))) (point) (cdr completions))))
+  (with-syntax-table python-dotty-syntax-table
+    (when-let ((symbol (thing-at-point 'symbol))
+               ((not (string-match (rx bos ?.) symbol)))
+               (bounds (bounds-of-thing-at-point 'symbol)))
+      (list (car bounds) (cdr bounds)
+            (or sage--completion-table
+                (setq sage--completion-table (sage-completion-table)))))))
 
 ;;;###autoload
 (define-derived-mode sage-mode python-mode "Sage"
@@ -215,9 +242,7 @@ It is the symbol at point when called interactively. PROC is the sage process."
         (proc (or proc (python-shell-get-process))))
     (prog1 buf
       (with-current-buffer buf (erase-buffer))
-      (sage-complete-redirection proc)
-      (with-current-buffer (process-buffer proc)
-        (comint-redirect-send-command (concat symbol "?") buf nil nil))
+      (comint-redirect-send-command-to-process (concat symbol "?") buf proc nil nil)
       (sage-complete-redirection proc)
       (with-current-buffer buf
         (ansi-color-apply-on-region (point-min) (point-max))
@@ -238,14 +263,6 @@ It is the symbol at point when called interactively. PROC is the sage process."
   "Save the current input."
   (setq sage--saved-input (progn (comint-goto-process-mark)
                                  (delete-and-extract-region (point) (point-max)))))
-
-(defun sage-send-input (proc command)
-  "Send COMMAND to PROC with some redirections."
-  (if-let ((command (string-trim-right command))
-           ((and (not (string-empty-p command)) (equal "?" (substring command -1)))))
-      (progn (sage-lookup-doc (substring command 0 -1) proc)
-             (comint-simple-send proc ""))
-    (comint-simple-send proc command)))
 
 (defun sage-send-line (proc)
   "Send current line to the sage process PROC."

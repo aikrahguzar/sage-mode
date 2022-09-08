@@ -109,5 +109,5 @@ Move to end of block sent."
   (save-excursion (when (sage-blocks-goto block)
                     (sage-blocks-send-current))))
 
-(provide 'sage-shell-blocks)
+(provide 'sage-blocks)
 ;;; sage-blocks.el ends here
