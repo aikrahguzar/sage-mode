@@ -140,11 +140,10 @@ nil the buffer `*Sage*' is used and resued if it already present.
 If buffer thus found has no associated process a sage process is satrted.
 SWITCHES are the arguments passed to it as in `make-comint-in-buffer'.
 If DISPLAY is non-nil the buffer is displayed."
-  (let ((buf (get-buffer-create (if (stringp buffer-name)
-                                    buffer-name
-                                  (if buffer-name
-                                      (generate-new-buffer-name "*Sage*")
-                                    "*Sage*")))))
+  (let ((buf (get-buffer-create
+              (if (stringp buffer-name)
+                  buffer-name
+                (format "*%s*" (python-shell-get-process-name buffer-name))))))
     (if display (display-buffer buf))
     (unless (get-buffer-process buf)
       (apply #'make-comint-in-buffer "Sage" buf (sage-executable) nil switches)
