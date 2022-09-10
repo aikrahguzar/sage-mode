@@ -113,11 +113,47 @@ __IP_completer = IPCompleter(shell=get_ipython() , namespace=locals())
 Default value is adapted from `python-shell-eval-setup-code' with the
 difference that this in addition preparses the sage input.")
 
+(defvar-local sage--process-busy-p nil)
+
+(defvar-local sage-next-redirect-command nil
+  "A cons (FUN . ARGS). FUN will be called with ARGS when redirect finishes.")
+
+(defvar-local sage--saved-input nil
+  "Saved input to restore after the process.")
+
+(defun sage--input-filter (_)
+  "Hook added to `comint-input-filter-functions'."
+  (setq sage--process-busy-p t))
+
+(defun sage--output-filter (output)
+  "Restore the input that was previously saved when OUTPUT has prompt."
+  (when (string-match (rx (regexp comint-prompt-regexp) eos) output)
+    (setq sage--process-busy-p nil)
+    (when sage--saved-input
+      (comint-goto-process-mark)
+      (insert sage--saved-input)
+      (setq sage--saved-input nil))))
+
+(defun sage--redirect-done ()
+  "Addition to `comint-redirect-hook'."
+  (with-current-buffer comint-redirect-output-buffer
+    (goto-char (point-min)))
+  (when sage-next-redirect-command
+    (let ((com sage-next-redirect-command))
+      (setq sage-next-redirect-command nil)
+      (apply (car com) (cdr com)))))
+
+(defun sage--save-input ()
+  "Save the current input."
+  (setq sage--saved-input (progn (comint-goto-process-mark)
+                                 (delete-and-extract-region (point) (point-max)))))
+
 (define-derived-mode sage-shell-mode inferior-python-mode
   "Sage Repl" "Execute Sage commands interactively."
   :group 'sage
 
-  (setq-local comint-redirect-finished-regexp comint-prompt-regexp
+  (setq-local comint-prompt-regexp (rx (regexp comint-prompt-regexp) eos)
+              comint-redirect-perform-sanity-check nil
               comint-redirect-completed t
               comint-input-ring-file-name sage-history-file
               comint-input-ignoredups t)
@@ -130,7 +166,11 @@ difference that this in addition preparses the sage input.")
   (setq-local completion-at-point-functions '(sage-completions-at-point t))
 
   (add-hook 'kill-buffer-hook #'comint-write-input-ring nil t)
-  (add-hook 'comint-output-filter-functions #'sage--restore-input-maybe t t))
+
+  (add-hook 'comint-input-filter-functions #'sage--input-filter nil t)
+  (add-hook 'comint-output-filter-functions #'sage--output-filter t t)
+  (add-hook 'comint-redirect-filter-functions #'ansi-color-apply nil t)
+  (add-hook 'comint-redirect-hook #'sage--redirect-done nil t))
 
 (defvar python-shell--interpreter)
 (defvar python-shell--interpreter-args)
@@ -179,6 +219,18 @@ If DISPLAY is non-nil display the resulting buffer."
 
 (defvar-local sage--completion-table nil)
 
+(defun sage-busy-p (buf)
+  "Return non-nil if sage process in BUF is busy."
+  (or (not (buffer-local-value 'comint-redirect-completed buf))
+      (buffer-local-value 'sage--process-busy-p buf)))
+
+(defun sage-completions-list (symbol proc)
+  "Return a list of completions for SYMBOL from sage process PROC."
+  (comint-redirect-results-list-from-process
+   proc
+   (concat "__IP_completer.all_completions('" symbol "')")
+   (rx ?' (group-n 1 (* (not ?'))) ?') 1))
+
 (defun sage-completion-table ()
   "A completion table returning completions from sage process PROC.
 It returns a lambda which accepts one argumet SYMBOL and returns
@@ -192,17 +244,14 @@ for the fact that we get new completions after encountering a new dot."
          (new-fun
           (lambda (arg)
             (if (and last-arg (string-prefix-p last-arg arg t)
-                     (not (string-match (rx ?.) arg (max 0 (1- (length last-arg))))))
+                     (not (string-match-p (rx ?.) arg (max 0 (1- (length last-arg))))))
                 last-result
-              (when-let ((completions
-                          (while-no-input
-                            (comint-redirect-results-list-from-process
-                             proc
-                             (format "__IP_completer.all_completions('%s')" arg)
-                             (rx ?' (group-n 1 (* (not ?'))) ?') 1)))
+              (unless (process-live-p proc)
+                (setq proc (python-shell-get-process)))
+              (when-let (((not (sage-busy-p (process-buffer proc))))
+                         (completions (while-no-input (sage-completions-list arg proc)))
                          ((not (booleanp completions))))
                 (setq last-arg arg)
-                (message arg)
                 (setq last-result completions))))))
     (completion-table-dynamic new-fun)))
 
@@ -234,35 +283,23 @@ for the fact that we get new completions after encountering a new dot."
     (while (and (null comint-redirect-completed)
                 (accept-process-output proc)))))
 
-(defun sage-lookup-doc (symbol &optional proc)
+(defun sage-lookup-doc (symbol &optional proc display)
   "Look up documentation for the SYMBOL.
-It is the symbol at point when called interactively. PROC is the sage process."
-  (interactive (list (python-info-current-symbol)))
+It is the symbol at point when called interactively. PROC is the sage process.
+If DISPLAY is non-nil, buffer is displayed."
+  (interactive (list (python-info-current-symbol) (python-shell-get-process) t))
   (let ((buf (get-buffer-create "*Sage Documentation*"))
         (proc (or proc (python-shell-get-process))))
     (prog1 buf
-      (with-current-buffer buf (erase-buffer))
-      (comint-redirect-send-command-to-process (concat symbol "?") buf proc nil nil)
-      (sage-complete-redirection proc)
       (with-current-buffer buf
-        (ansi-color-apply-on-region (point-min) (point-max))
-        (goto-char (point-min)))
-      (display-buffer buf))))
-
-(defvar-local sage--saved-input nil
-  "Saved input to restore after the process.")
-
-(defun sage--restore-input-maybe (_)
-  "Restore the input that was previously saved."
-  (when sage--saved-input
-    (comint-goto-process-mark)
-    (insert sage--saved-input)
-    (setq sage--saved-input nil)))
-
-(defun sage--save-input ()
-  "Save the current input."
-  (setq sage--saved-input (progn (comint-goto-process-mark)
-                                 (delete-and-extract-region (point) (point-max)))))
+        (erase-buffer)
+        (setq mode-line-format nil)
+        (visual-line-mode)
+        (font-lock-mode))
+      (comint-redirect-send-command-to-process
+       (format "get_ipython().run_line_magic('pinfo', '%s')" symbol)
+       buf proc nil nil)
+      (when display (pop-to-buffer buf)))))
 
 (defun sage-send-line (proc)
   "Send current line to the sage process PROC."
