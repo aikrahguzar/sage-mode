@@ -3,7 +3,7 @@
 ;; Copyright (C) 2013-2018 Johan Rosenkilde
 
 ;; Author: Johan Rosenkilde <jsrn@jsrn.dk>
-;; URL: https://github.com/sagemath/sage-shell-mode
+;; URL: https://github.com/aikrahguzr/sage-mode
 ;; Keywords: Sage, math
 
 ;;; License

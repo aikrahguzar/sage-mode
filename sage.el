@@ -1,7 +1,7 @@
 ;;; sage.el --- A front-end for Sage Math -*- lexical-binding: t -*-
 
 ;; URL: https://github.com/aikrahguzar/sage-mode
-;; Package-Requires: ((emacs "25.1"))
+;; Package-Requires: ((emacs "25.1") (compat "28.1"))
 ;; Keywords: languages, processes, tools
 ;; Version: 0.1
 
@@ -40,6 +40,7 @@
 (require 'comint)
 (require 'python)
 (require 'compile)
+(require 'compat)
 
 ;;; Global variables for users
 (defgroup sage
@@ -103,15 +104,54 @@ def __PYTHON_EL_eval(source, filename):
         t, v, tb = sys.exc_info()
         sys.excepthook(t, v, tb.tb_next)
 
+get_ipython().cache_size = int(0)
+get_ipython().history_manager.enabled = False
+
 import jedi
 jedi.settings.case_insensitive_completion = True
 
 from IPython.core.completer import IPCompleter
 __IP_completer = IPCompleter(shell=get_ipython() , namespace=locals())
+__IP_completer.jedi_compute_type_timeout = int(0)
+
+def __SAGE_complete(str):
+    return [x + '        ' + __PYDOC_get_help(x) for x in __IP_completer.all_completions(str)]
 "
   "Code used to evaluate statements in sage repl.
 Default value is adapted from `python-shell-eval-setup-code' with the
 difference that this in addition preparses the sage input.")
+
+(defvar sage-eldoc-setup-doc
+  "\
+def __PYDOC_get_help(obj):
+    import inspect
+    doc = None
+    ann = ''
+    try:
+        if isinstance(obj, str):
+            obj = eval(obj, globals())
+            doc = inspect.getdoc(obj)
+        if doc:
+            ann = doc.splitlines()[0]
+        if callable(obj):
+            target = None
+            if inspect.isclass(obj) and hasattr(obj, '__init__'):
+                target = obj.__init__
+                objtype = 'class'
+            else:
+                target = obj
+                objtype = 'def'
+            if target:
+                args = str(inspect.signature(obj))
+                name = obj.__name__
+                ann = f'{objtype} {name}{args}' + ': ' + ann
+    except:
+        ann = ' '
+    return ann
+"
+"Code used to override `python-eldoc-setup-code'.
+This is to supress a warning that makes its way to eldoc string.
+It also combines both the argspec and the first line of documentation.")
 
 (defvar-local sage--process-busy-p nil)
 
@@ -148,6 +188,11 @@ difference that this in addition preparses the sage input.")
   (setq sage--saved-input (progn (comint-goto-process-mark)
                                  (delete-and-extract-region (point) (point-max)))))
 
+(defun sage-first-prompt-setup ()
+  "Setup the interactive session using `python-shell-first-prompt-hook'."
+  (python-shell-send-string-no-output sage-eldoc-setup-doc)
+  (python-shell-send-string-no-output sage-setup-code))
+
 (define-derived-mode sage-shell-mode inferior-python-mode
   "Sage Repl" "Execute Sage commands interactively."
   :group 'sage
@@ -158,19 +203,19 @@ difference that this in addition preparses the sage input.")
               comint-input-ring-file-name sage-history-file
               comint-input-ignoredups t)
 
-  (comint-read-input-ring t)
+  (setq-local python-shell-completion-native-enable nil)
 
-  (setq-local python-shell-setup-codes (list sage-setup-code)
-              python-shell-completion-native-enable nil)
+  (comint-read-input-ring t)
 
   (setq-local completion-at-point-functions '(sage-completions-at-point t))
 
-  (add-hook 'kill-buffer-hook #'comint-write-input-ring nil t)
+  (add-hook 'kill-buffer-hook #'comint-write-input-ring)
 
   (add-hook 'comint-input-filter-functions #'sage--input-filter nil t)
   (add-hook 'comint-output-filter-functions #'sage--output-filter t t)
   (add-hook 'comint-redirect-filter-functions #'ansi-color-apply nil t)
-  (add-hook 'comint-redirect-hook #'sage--redirect-done nil t))
+  (add-hook 'comint-redirect-hook #'sage--redirect-done nil t)
+  (add-hook 'python-shell-first-prompt-hook #'sage-first-prompt-setup))
 
 (defvar python-shell--interpreter)
 (defvar python-shell--interpreter-args)
@@ -226,10 +271,17 @@ If DISPLAY is non-nil display the resulting buffer."
 
 (defun sage-completions-list (symbol proc)
   "Return a list of completions for SYMBOL from sage process PROC."
-  (comint-redirect-results-list-from-process
-   proc
-   (concat "__IP_completer.all_completions('" symbol "')")
-   (rx ?' (group-n 1 (* (not ?'))) ?') 1))
+  (let ((raw (comint-redirect-results-list-from-process
+              proc
+              (concat "__SAGE_complete('" symbol "')")
+              (rx (or (seq ?\" (group-n 1 (* (not ?\"))) ?\")
+                      (seq ?' (group-n 1 (* (not ?'))) ?'))) 1))
+        (completions))
+    (dolist (r raw completions)
+      (let ((pos (string-search " " r)))
+        (push (propertize (substring r 0 pos)
+                          :annotation (substring r (1+ pos)))
+              completions)))))
 
 (defun sage-completion-table ()
   "A completion table returning completions from sage process PROC.
@@ -244,8 +296,9 @@ for the fact that we get new completions after encountering a new dot."
          (new-fun
           (lambda (arg)
             (if (and last-arg (string-prefix-p last-arg arg t)
-                     (not (string-match-p (rx ?.) arg (max 0 (1- (length last-arg))))))
+                     (not (string-match-p (rx (or ?.)) arg (max 0 (1- (length last-arg))))))
                 last-result
+            (message arg)
               (unless (process-live-p proc)
                 (setq proc (python-shell-get-process)))
               (when-let (((not (sage-busy-p (process-buffer proc))))
@@ -258,12 +311,27 @@ for the fact that we get new completions after encountering a new dot."
 (defun sage-completions-at-point ()
   "Completions at point from the sage process."
   (with-syntax-table python-dotty-syntax-table
-    (when-let ((symbol (thing-at-point 'symbol))
-               ((not (string-match (rx bos ?.) symbol)))
-               (bounds (bounds-of-thing-at-point 'symbol)))
-      (list (car bounds) (cdr bounds)
-            (or sage--completion-table
-                (setq sage--completion-table (sage-completion-table)))))))
+    (if (not (save-excursion (goto-char (line-beginning-position))
+                             (looking-at (rx (or "from " "import ")))))
+        (when-let ((symbol (thing-at-point 'symbol))
+                   ((not (string-match (rx bos ?.) symbol)))
+                   (bounds (bounds-of-thing-at-point 'symbol)))
+          (list (car bounds) (cdr bounds)
+                (or sage--completion-table
+                    (setq sage--completion-table (sage-completion-table)))
+                :annotation-function
+                (lambda (cand) (propertize (get-text-property 0 :annotation cand)
+                                      'face font-lock-comment-face))))
+      (when-let ((completions (while-no-input
+                                (comint-redirect-results-list-from-process
+                                 (python-shell-get-process)
+                                 (format "get_ipython().complete('' , '%s' , %s)"
+                                         (buffer-substring (line-beginning-position)
+                                                           (line-end-position))
+                                         (- (point) (line-beginning-position)))
+                                 (rx (seq ?' (group-n 1 (* (not ?'))) ?')) 1)))
+                 ((not (booleanp completions))))
+        (list (- (point) (length (car completions))) (point) (cdr completions))))))
 
 ;;;###autoload
 (define-derived-mode sage-mode python-mode "Sage"
@@ -272,7 +340,8 @@ for the fact that we get new completions after encountering a new dot."
             'sage-completions-at-point nil t)
   (setq-local python-shell-buffer-name "Sage"
               python-shell-interpreter (sage-executable)
-              python-shell-interpreter-args "--simple-prompt"))
+              python-shell-interpreter-args "--simple-prompt"
+              python-eldoc-setup-code sage-eldoc-setup-doc))
 
 ;;;###autoload
 (cl-pushnew `(,(rx ".sage" eos) . sage-mode) auto-mode-alist :test #'equal)
