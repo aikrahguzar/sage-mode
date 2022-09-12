@@ -191,7 +191,12 @@ It also combines both the argspec and the first line of documentation.")
 (defun sage-first-prompt-setup ()
   "Setup the interactive session using `python-shell-first-prompt-hook'."
   (python-shell-send-string-no-output sage-eldoc-setup-doc)
-  (python-shell-send-string-no-output sage-setup-code))
+  (python-shell-send-string-no-output sage-setup-code)
+  (add-text-properties (line-beginning-position) (point)
+                       `(rear-nonsticky
+                         ,comint--prompt-rear-nonsticky
+                         field boundary
+                         inhibit-line-move-field-capture t)))
 
 (define-derived-mode sage-shell-mode inferior-python-mode
   "Sage Repl" "Execute Sage commands interactively."
