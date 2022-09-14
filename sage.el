@@ -76,6 +76,13 @@ This happens when the Sage process exits."
 
 (defvar sage-setup-code
   "\
+get_ipython().history_manager.enabled = False
+In.clear()
+get_ipython().history_manager.reset()
+
+import jedi
+jedi.settings.case_insensitive_completion = True
+
 def __PYTHON_EL_eval(source, filename):
     import ast, sys
     from sage.repl.preparse import preparse_file
@@ -104,26 +111,11 @@ def __PYTHON_EL_eval(source, filename):
         t, v, tb = sys.exc_info()
         sys.excepthook(t, v, tb.tb_next)
 
-get_ipython().cache_size = int(0)
-get_ipython().history_manager.enabled = False
-
-import jedi
-jedi.settings.case_insensitive_completion = True
-
 from IPython.core.completer import IPCompleter
 __IP_completer = IPCompleter(shell=get_ipython() , namespace=locals())
 __IP_completer.jedi_compute_type_timeout = int(0)
 
-def __SAGE_complete(str):
-    return [x + '        ' + __PYDOC_get_help(x) for x in __IP_completer.all_completions(str)]
-"
-  "Code used to evaluate statements in sage repl.
-Default value is adapted from `python-shell-eval-setup-code' with the
-difference that this in addition preparses the sage input.")
-
-(defvar sage-eldoc-setup-doc
-  "\
-def __PYDOC_get_help(obj):
+def __SAGE_annotate(obj):
     import inspect
     doc = None
     ann = ''
@@ -148,10 +140,26 @@ def __PYDOC_get_help(obj):
     except:
         ann = ' '
     return ann
+
+def __SAGE_complete(str):
+    In.pop()
+    print([x + '        ' + __SAGE_annotate(x) for x in __IP_completer.all_completions(str)])
+
+def __SAGE_complete_import(str,offset):
+    In.pop()
+    print(get_ipython().complete('', str, offset))
+
+def  __PYDOC_get_help(obj):
+    In.pop()
+    return __SAGE_annotate(obj)
+
+def __SAGE_get_doc(str):
+    In.pop()
+    get_ipython().run_line_magic('pinfo', str)
 "
-"Code used to override `python-eldoc-setup-code'.
-This is to supress a warning that makes its way to eldoc string.
-It also combines both the argspec and the first line of documentation.")
+  "Code used to evaluate statements in sage repl.
+Default value is adapted from `python-shell-eval-setup-code' with the
+difference that this in addition preparses the sage input.")
 
 (defvar-local sage--process-busy-p nil)
 
@@ -190,7 +198,6 @@ It also combines both the argspec and the first line of documentation.")
 
 (defun sage-first-prompt-setup ()
   "Setup the interactive session using `python-shell-first-prompt-hook'."
-  (python-shell-send-string-no-output sage-eldoc-setup-doc)
   (python-shell-send-string-no-output sage-setup-code)
   (add-text-properties (line-beginning-position) (point)
                        `(rear-nonsticky
@@ -303,7 +310,6 @@ for the fact that we get new completions after encountering a new dot."
             (if (and last-arg (string-prefix-p last-arg arg t)
                      (not (string-match-p (rx (or ?.)) arg (max 0 (1- (length last-arg))))))
                 last-result
-            (message arg)
               (unless (process-live-p proc)
                 (setq proc (python-shell-get-process)))
               (when-let (((not (sage-busy-p (process-buffer proc))))
@@ -330,7 +336,7 @@ for the fact that we get new completions after encountering a new dot."
       (when-let ((completions (while-no-input
                                 (comint-redirect-results-list-from-process
                                  (python-shell-get-process)
-                                 (format "get_ipython().complete('' , '%s' , %s)"
+                                 (format "__SAGE_complete_import('%s' , %s)"
                                          (buffer-substring (line-beginning-position)
                                                            (line-end-position))
                                          (- (point) (line-beginning-position)))
@@ -346,16 +352,10 @@ for the fact that we get new completions after encountering a new dot."
   (setq-local python-shell-buffer-name "Sage"
               python-shell-interpreter (sage-executable)
               python-shell-interpreter-args "--simple-prompt"
-              python-eldoc-setup-code sage-eldoc-setup-doc))
+              python-eldoc-setup-code ""))
 
 ;;;###autoload
 (cl-pushnew `(,(rx ".sage" eos) . sage-mode) auto-mode-alist :test #'equal)
-
-(defun sage-complete-redirection (proc)
-  "Accept input from PROC until redirection completes."
-  (with-current-buffer (process-buffer proc)
-    (while (and (null comint-redirect-completed)
-                (accept-process-output proc)))))
 
 (defun sage-lookup-doc (symbol &optional proc display)
   "Look up documentation for the SYMBOL.
@@ -371,8 +371,8 @@ If DISPLAY is non-nil, buffer is displayed."
         (visual-line-mode)
         (font-lock-mode))
       (comint-redirect-send-command-to-process
-       (format "get_ipython().run_line_magic('pinfo', '%s')" symbol)
-       buf proc nil nil)
+       (format "__SAGE_get_doc('%s')" symbol)
+       buf proc nil t)
       (when display (pop-to-buffer buf)))))
 
 (defun sage-send-line (proc)
